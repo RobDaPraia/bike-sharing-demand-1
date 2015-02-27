@@ -1,0 +1,56 @@
+# Require packages
+require(pscl)
+require(splines)
+
+
+# Apply Zero-inflated Count Model for casual und registered separately
+
+# Casual: Define formula
+CASUAL <- (casual ~ 
+             year + month + wday + hour
+           + year:month
+           + wday:hour
+           + ns(temp, 4)
+           + ns(humidity, 4)
+           + ns(windspeed, 4)
+           + temp_c:humidity_c
+           + temp_c:windspeed_c
+           + humidity_c:windspeed_c | ns(atemp_c, 4) + ns(humidity_c, 4))
+           
+
+# Estimate model
+m1.casual <- zeroinfl(CASUAL, data = Xtrain, dist = "negbin")
+summary(m1.casual)
+
+
+# Registered: Define formula
+REGISTERED <- (registered ~ 
+                 year + month + wday + hour
+               + year:month
+               + wday:hour
+               + ns(temp, 4)
+               + ns(humidity, 4)
+               + ns(windspeed, 4)
+               + temp_c:humidity_c
+               + temp_c:windspeed_c
+               + humidity_c:windspeed_c | 1)
+
+
+# Estimate model
+m2.registered <- zeroinfl(REGISTERED, data = Xtrain, dist = "negbin")
+summary(m2.registered)
+
+
+# Predict count = casual + registered
+predict.casual <- predict(m1.casual, Xtest)
+predict.reg <- predict(m2.registered, Xtest)
+predict.count <- round(predict.casual) + round(predict.reg)
+
+
+# Build dataframe with results
+submit <- data.frame(datetime = Xtest$datetime, count = predict.count)
+
+
+# Write results to .csv for submission
+write.csv(submit, file="submit_zeroinfl_splines_5.csv",row.names=FALSE)
+
