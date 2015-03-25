@@ -1,0 +1,457 @@
+Kaggle Competition: Predicting Bike Sharing Demand Using Count Data Models and Tree-based Methods
+========================================================
+Author: Rami Al-Fahham
+
+### Exploratory Analysis
+
+##### Import data
+```{r}
+train <- read.csv("train.csv", stringsAsFactors=FALSE, sep=",", dec = ".")
+test  <- read.csv("test.csv", stringsAsFactors=FALSE, sep=",", dec = ".")
+```
+
+##### Quick overview of data structure and descriptive statistics
+```{r message=FALSE, warning=FALSE}
+require(ggplot2)
+require(lattice)
+
+#Quick summary
+str(train)
+summary(train)
+```
+
+##### Scatterplots, correlations and histogramms for continious variables
+```{r}
+# Customized functions for correlations and histograms (try ?pairs)
+panel.cor <- function(x, y, digits = 2, prefix = "", cex.cor, ...)
+{
+    usr <- par("usr"); on.exit(par(usr))
+    par(usr = c(0, 1, 0, 1))
+    r <- abs(cor(x, y))
+    txt <- format(c(r, 0.123456789), digits = digits)[1]
+    txt <- paste0(prefix, txt)
+    if(missing(cex.cor)) cex.cor <- 0.8/strwidth(txt)
+    text(0.5, 0.5, txt, cex = cex.cor * r)
+}
+
+panel.hist <- function(x, ...)
+{
+    usr <- par("usr"); on.exit(par(usr))
+    par(usr = c(usr[1:2], 0, 1.5) )
+    h <- hist(x, plot = FALSE)
+    breaks <- h$breaks; nB <- length(breaks)
+    y <- h$counts; y <- y/max(y)
+    rect(breaks[-nB], 0, breaks[-1], y, col = "cyan", ...)
+}
+```
+
+```{r}
+pairs(train[5:11], upper.panel = panel.cor,
+                   diag.panel  = panel.hist,
+                   lower.panel = panel.smooth)
+```
+
+##### Data preparation
+```{r}
+setup_predictors <- function(df){
+  df$year   <- factor(as.numeric(substr(as.Date(df$datetime), 1, 4)),
+                      levels = unique(as.numeric(substr(as.Date(df$datetime), 1, 4))))
+  df$month  <- factor(months(as.Date(df$datetime)),
+                     levels = unique(months(as.Date(df$datetime))))
+  df$wday   <- factor(weekdays(as.Date(df$datetime)),
+                      levels = unique(weekdays(as.Date(df$datetime))))
+  df$hour   <- factor(as.numeric(substr(df$datetime,12,13)))
+  
+  df$weekend <- ifelse(df$wday == "Samstag" | df$wday == "Sonntag", 1, 0) 
+  
+  df$season   <- factor(df$season)
+  
+  df$weather   <- factor(df$weather)
+  
+  # Create centered continious variables
+  df$temp_c <- df$temp-mean(df$temp)
+  df$wind_c <- df$windspeed-mean(df$windspeed)
+  df$humidity_c <- df$humidity-mean(df$humidity)
+  
+  df
+}
+
+train <- setup_predictors(train)
+test  <- setup_predictors(test)
+```
+
+##### Monthly patterns for casual and registered
+```{r}
+# Plot for casual
+p.c <- ggplot(train, aes(x=as.integer(month), y=casual)) + 
+                      geom_point() +
+                      facet_grid(. ~ year) +
+                      scale_x_discrete() +
+                      ggtitle("Monthly patterns for casual")
+
+p.r <- ggplot(train, aes(x=as.integer(month), y=registered)) + 
+                      geom_point() +
+                      facet_grid(. ~ year) +
+                      scale_x_discrete() +
+                      ggtitle("Monthly patterns for registered")
+            
+# Define multiplot function (see Cookbook for R)
+multiplot <- function(..., plotlist=NULL, file, cols=1, layout=NULL) {
+  require(grid)
+
+  # Make a list from the ... arguments and plotlist
+  plots <- c(list(...), plotlist)
+
+  numPlots = length(plots)
+
+  # If layout is NULL, then use 'cols' to determine layout
+  if (is.null(layout)) {
+    # Make the panel
+    # ncol: Number of columns of plots
+    # nrow: Number of rows needed, calculated from # of cols
+    layout <- matrix(seq(1, cols * ceiling(numPlots/cols)),
+                    ncol = cols, nrow = ceiling(numPlots/cols))
+  }
+
+ if (numPlots==1) {
+    print(plots[[1]])
+
+  } else {
+    # Set up the page
+    grid.newpage()
+    pushViewport(viewport(layout = grid.layout(nrow(layout), ncol(layout))))
+
+    # Make each plot, in the correct location
+    for (i in 1:numPlots) {
+      # Get the i,j matrix positions of the regions that contain this subplot
+      matchidx <- as.data.frame(which(layout == i, arr.ind = TRUE))
+
+      print(plots[[i]], vp = viewport(layout.pos.row = matchidx$row,
+                                      layout.pos.col = matchidx$col))
+    }
+  }
+}
+
+
+# Plots for casual
+multiplot(p.c, p.r)
+```
+
+##### Daily and hourly pattern for casual and registered
+```{r}
+# Aggregation by summing up over wday and hour
+agg.cas <- with(train, 
+                setNames(aggregate(casual, 
+                          by=list(wday, hour), 
+                          sum, na.rm=TRUE), c("wday", "hour", "casual")
+                         )
+                )
+
+agg.reg <- with(train, 
+                setNames(aggregate(registered, 
+                          by=list(wday, hour), 
+                          sum, na.rm=TRUE), c("wday", "hour", "registered")
+                         )
+                )
+
+# Create heatmaps
+h.c <- ggplot(agg.cas, aes(x=hour, y=wday, fill=casual)) +
+              geom_raster() +
+              ggtitle("Daily / hourly patterns for casual")
+
+h.r <- ggplot(agg.reg, aes(x=hour, y=wday, fill=registered)) +
+              geom_raster() +
+              ggtitle("Daily / hourly patterns for registered")
+
+multiplot(h.c, h.r)
+```
+
+### (1) Regression Model for Count Data
+  + apply Hurdle Model for count data with large number of zeros for casual and registered separately
+  + use temp, humidity, year, month, wday, hour as predictors
+  + use splines (smoothing) for continious predictors
+  + use interaction variables
+```{r message=FALSE, warning=FALSE}
+# Require packages
+require(pscl)
+require(splines)
+require(Metrics)
+require(utils)
+```
+
+##### Define different models ranging from lower to higher complexity 
+```{r}
+# Models for casual
+c1 <- (casual ~ year + month + wday + hour
+              + temp
+              + humidity | 1)
+
+c2 <- (casual ~ year + month + wday + hour
+              + year:month
+              + wday:hour
+              + temp
+              + humidity | 1)
+
+c3 <- (casual ~ year + month + wday + hour
+              + year:month
+              + wday:hour
+              + ns(temp, knots=2)
+              + ns(humidity, knots=2) | 1)
+
+c4 <- (casual ~ year + month + wday + hour
+              + year:month
+              + wday:hour
+              + ns(temp, knots=2)
+              + ns(humidity, knots=2)
+              + temp_c:humidity_c
+              + temp_c:wind_c
+              + wind_c:humidity_c | 1)
+
+# Predictor selection for binomial part using package bestglm
+# library(bestglm)
+# casX <- with(train, 
+#          data.frame(temp, humidity, windspeed, workingday, holiday, ifelse(casual==0, 0, 1)))
+# bestglm(casX, family=binomial)
+
+c5 <- (casual ~ year + month + wday + hour
+              + year:month
+              + wday:hour
+              + ns(temp, knots=2)
+              + ns(humidity, knots=2)
+              + temp_c:humidity_c
+              + temp_c:wind_c
+              + wind_c:humidity_c | temp + humidity + workingday)
+
+# Put all models for casual in a list
+casList <- list(c1=c1, c2=c2, c3=c3, c4=c4, c5=c5)
+
+# Models for casual
+r1 <- (registered ~ year + month + wday + hour
+              + temp
+              + humidity | 1)
+
+r2 <- (registered ~ year + month + wday + hour
+              + year:month
+              + wday:hour
+              + temp
+              + humidity | 1)
+
+r3 <- (registered ~ year + month + wday + hour
+              + year:month
+              + wday:hour
+              + ns(temp, knots=2)
+              + ns(humidity, knots=2) | 1)
+
+r4 <- (registered ~ year + month + wday + hour
+              + year:month
+              + wday:hour
+              + ns(temp, knots=2)
+              + ns(humidity, knots=2)
+              + temp_c:humidity_c
+              + temp_c:wind_c
+              + wind_c:humidity_c | 1)
+
+# Predictor selection for binomial part using package bestglm
+# library(bestglm)
+# regX <- with(train, 
+#          data.frame(temp, humidity, windspeed, workingday, holiday, ifelse(registered==0, 0, 1)))
+# bestglm(regX, family=binomial)
+
+r5 <- (registered ~ year + month + wday + hour
+              + year:month
+              + wday:hour
+              + ns(temp, knots=2)
+              + ns(humidity, knots=2)
+              + temp_c:humidity_c
+              + temp_c:wind_c
+              + wind_c:humidity_c | temp)
+
+# Put all models for registered in a list
+regList <- list(r1=r1, r2=r2, r3=r3, r4=r4, r5=r5)
+```
+
+#### Casual bike demand: Model selection through k-fold cross-validation (k = 5)
+```{r eval=FALSE}
+# Create 5 folds of the training data set and CV error matrix for casual models
+k <- 5
+set.seed(17)
+folds <- sample(1:k, nrow(train), replace=TRUE)
+cv.errors.cas <- matrix(NA, nrow = k, ncol = length(casList),
+                    dimnames=list(NULL, paste(names(casList))))
+
+# CV loops with progress bars
+for(i in 1:5){
+  # Initialize progress bar
+  pb <- txtProgressBar(min = 0, max = 5, style = 3)
+  
+  for(j in 1:k){
+
+  # Update pb
+  setTxtProgressBar(pb, j)
+
+  # Estimate model
+  cas.fit <- hurdle(casList[[i]], data = train[folds!=j,], dist = "negbin") 
+    
+  # Prediction with root mean squared log error
+  pred <- predict(cas.fit, train[folds == j,])
+  cv.errors.cas[j,i] = rmsle(train$casual[folds == j], pred)
+  }
+  close(pb)
+}
+```
+
+
+#### Registered bike demand: Model selection through k-fold cross-validation (k = 5)
+```{r eval=FALSE}
+# Create CV error matrix for registered models
+cv.errors.reg <- matrix(NA, nrow = k, ncol = length(regList),
+                    dimnames=list(NULL, paste(names(regList))))
+
+# CV loops with progress bars
+for(i in 1:5){
+  # Initialize progress bar
+  pb <- txtProgressBar(min = 0, max = 5, style = 3)
+  
+  for(j in 1:k){
+
+  # Update pb
+  setTxtProgressBar(pb, j)
+
+  # Estimate model
+  reg.fit <- hurdle(regList[[i]], data = train[folds!=j,], dist = "negbin") 
+    
+  # Prediction with root mean squared log error
+  pred <- predict(reg.fit, train[folds == j,])
+  cv.errors.reg[j,i] = rmsle(train$registered[folds == j], pred)
+  }
+  close(pb)
+}
+```
+
+##### Find model with minimum test error
+```{r eval=FALSE}
+# casual
+apply(cv.errors.cas, 2, mean)
+
+# registered
+apply(cv.errors.reg, 2, mean)
+```
+
+##### Predict count = casual + registered and write file to submit
+```{r eval=FALSE}
+predict.casual <- predict(hurdle(casList[[5]], data = train, dist = "negbin"), test)
+predict.reg <- predict(hurdle(regList[[5]], data = train, dist = "negbin"), test)
+predict.count <- round(predict.casual) + round(predict.reg)
+
+# Build dataframe with results
+hurdle.submit <- data.frame(datetime = test$datetime, count = predict.count)
+
+# Write results to .csv for submission
+write.csv(hurdle.submit, file="submit_hurdle_model.csv",row.names=FALSE)
+```
+#### Using a Count Data Model: "Your submission scored 0.49784"
+
+
+### (2) Tree-based Methods
+  + Random Forests
+  + Boosting
+  + (How handle casual / registered with lots of zeros?)
+```{r message=FALSE, warning=FALSE}
+require(randomForest)
+require(MASS)
+require(gbm)
+```
+
+##### Fit Random Forest Model
+```{r eval=FALSE}
+# Model for bike casual demand
+set.seed(7)
+rf.cas <- randomForest(casual ~ year + month + wday + hour + weekend
+                          + season + workingday + holiday + weather
+                          + temp + atemp + humidity + windspeed,
+                          data = train, mtry = 6, importance = TRUE)
+
+# Model for registered bike demand
+set.seed(8)
+rf.reg <- randomForest(registered ~ year + month + wday + hour + weekend
+                          + season + workingday + holiday + weather
+                          + temp + atemp + humidity + windspeed,
+                          data = train, mtry = 6, importance = TRUE)
+
+# Model for count bike demand
+set.seed(9)
+rf.count <- randomForest(count ~ year + month + wday + hour + weekend
+                          + season + workingday + holiday + weather
+                          + temp + atemp + humidity + windspeed,
+                          data = train, mtry = 6, importance = TRUE)
+
+
+# Plot variable importance
+varImpPlot(rf.cas, main = "variable importance, casual")
+varImpPlot(rf.reg, main = "variable importance, registered")
+varImpPlot(rf.count, main = "variable importance, count")
+```
+
+##### Predict count and write file to submit
+```{r eval=FALSE}
+rf.predict.sep <- round(predict(rf.cas, test) + predict(rf.reg, test))
+rf.predict <- round(predict(rf.count, test))
+
+# Build dataframe with results
+rf.submit.sep <- data.frame(datetime = test$datetime, count = rf.predict.sep)
+rf.submit <- data.frame(datetime = test$datetime, count = rf.predict)
+
+# Write results to .csv for submission
+write.csv(rf.submit.sep, file="submit_randomForest_Sep.csv", row.names=FALSE)
+write.csv(rf.submit, file="submit_randomForest.csv", row.names=FALSE)
+```
+#### a) Score using RF method separately for casual and registered: 0.64423
+#### b) Score using RF method for count: 0.65030
+
+
+##### Fit Boosting Model
+```{r eval=FALSE}
+# Model for casual bike demand
+set.seed(13)
+boost.cas <- gbm(casual ~ year + month + wday + hour + weekend
+                          + season + workingday + holiday + weather
+                          + temp + atemp + humidity + windspeed,
+                          data = train, distribution = "poisson", n.trees = 100000, interaction.depth = 6)
+
+# Model for registered bike demand
+set.seed(15)
+boost.reg <- gbm(registered ~ year + month + wday + hour + weekend
+                          + season + workingday + holiday + weather
+                          + temp + atemp + humidity + windspeed,
+                          data = train, distribution = "poisson", n.trees = 100000, interaction.depth = 6)
+
+# Model for count bike demand
+set.seed(16)
+boost.count <- gbm(count ~ year + month + wday + hour + weekend
+                          + season + workingday + holiday + weather
+                          + temp + atemp + humidity + windspeed,
+                          data = train, distribution = "poisson", n.trees = 750000, interaction.depth = 4)
+
+summary(boost.cas)
+summary(boost.reg)
+summary(boost.count)
+```
+
+##### Predict count and write file to submit
+```{r eval=FALSE}
+boost.predict.sep <- round(predict(boost.cas, newdata = test, n.trees = 100000, type="response") + predict(boost.reg, newdata = test, n.trees = 100000, type="response"))
+boost.predict <- round(predict(boost.count, newdata = test, n.trees = 750000, type="response"))
+
+# Build dataframe with results
+boost.submit.sep <- data.frame(datetime = test$datetime, count = boost.predict.sep)
+boost.submit <- data.frame(datetime = test$datetime, count = boost.predict)
+
+# Write results to .csv for submission
+write.csv(boost.submit.sep, file = "submit_boosting_Sep_100000.csv", row.names=FALSE)
+write.csv(boost.submit, file = "submit_boosting750000.csv", row.names=FALSE)
+
+```
+#### Boosting separately for casual and registered scored (100.000 trees, interaction.depth = 6): 0.47042
+#### Boosting for count scored (750.000 trees, interaction.depth = 4): 0.44538
+
+
